@@ -96,6 +96,7 @@ RESISTOR_SEARCH_CONFIG = {
     "category_name": "Chip Resistor - Surface Mount",
     "category_id": 52,
     "keyword": "resistor",
+    "split_param_id": 2085,  # Resistance - segment by value when > 300
     "parameters": [
         {"name": "Resistance", "key": "resistance", "param_id": 2085,
          "values": ["", "1", "10", "100", "1k", "4.7k", "10k",
@@ -118,6 +119,7 @@ CAPACITOR_SEARCH_CONFIG = {
     "category_name": "Ceramic Capacitors",
     "category_id": 60,
     "keyword": "capacitor ceramic",
+    "split_param_id": 2049,  # Capacitance - segment by value when > 300
     "parameters": [
         {"name": "Capacitance", "key": "capacitance", "param_id": 2049,
          "values": ["", "10pF", "100pF", "1nF", "10nF", "100nF",
@@ -139,6 +141,7 @@ INDUCTOR_SEARCH_CONFIG = {
     "category_name": "Fixed Inductors",
     "category_id": 71,
     "keyword": "inductor",
+    "split_param_id": 2088,  # Inductance - segment by value when > 300
     "parameters": [
         {"name": "Inductance", "key": "inductance", "param_id": 2088,
          "values": ["", "1nH", "10nH", "100nH", "1uH", "4.7uH",
@@ -521,23 +524,13 @@ class DigiKeyClient:
         if filter_opts:
             body["FilterOptionsRequest"] = filter_opts
 
-        # Debug: dump first request body for inspection
-        if offset == 0:
-            try:
-                debug_path = os.path.join(os.path.dirname(__file__),
-                                           "_debug_request.json")
-                with open(debug_path, "w", encoding="utf-8") as f:
-                    json.dump(body, f, indent=2, ensure_ascii=False)
-            except Exception:
-                pass
-
         result = self._make_request(url, method="POST", data=body,
                                      headers=self._api_headers())
         return result
 
     def search_all(self, keywords, category_id=None,
                    manufacturer_ids=None, parameter_filters=None,
-                   progress_callback=None):
+                   progress_callback=None, stop_flag=None):
         """
         搜索并获取所有结果（自动翻页）
 
@@ -558,6 +551,8 @@ class DigiKeyClient:
         page_size = 50
 
         while True:
+            if stop_flag and stop_flag.is_set():
+                break
             # Ensure we don't exceed API limit
             if offset + page_size > API_MAX_OFFSET:
                 remaining = API_MAX_OFFSET - offset
@@ -597,6 +592,156 @@ class DigiKeyClient:
             time.sleep(0.5)
 
         return all_products
+
+    def search_all_segmented(self, keywords, category_id=None,
+                              manufacturer_ids=None,
+                              parameter_filters=None,
+                              split_param_id=None,
+                              split_value_ids=None,
+                              progress_callback=None,
+                              segment_callback=None,
+                              stop_flag=None):
+        """
+        获取所有结果，当总数超过 300 时自动按 split 参数分段获取。
+
+        Args:
+            keywords, category_id, manufacturer_ids, parameter_filters:
+                与 search_all 相同
+            split_param_id: 用于分段的参数 ID（如 2085=阻值）
+            split_value_ids: 该参数所有可用的 ValueId 列表
+            progress_callback: fn(fetched, estimated_total, message)
+            segment_callback: fn(new_products) - 每完成一个分段就回调
+
+        Returns:
+            tuple: (all_products, total_estimated)
+        """
+        API_MAX = 300
+        base_filters = parameter_filters or []
+
+        # 如果没有分段参数，直接普通搜索
+        if not split_param_id or not split_value_ids:
+            products = self.search_all(
+                keywords, category_id=category_id,
+                manufacturer_ids=manufacturer_ids,
+                parameter_filters=base_filters or None,
+                progress_callback=lambda c, t:
+                    progress_callback(c, t, "") if progress_callback else None,
+                stop_flag=stop_flag,
+            )
+            if segment_callback and products:
+                segment_callback(products)
+            return products, len(products)
+
+        # 先探测不带分段参数时的总数
+        probe = self.search_keyword(
+            keywords, limit=1, category_id=category_id,
+            manufacturer_ids=manufacturer_ids,
+            parameter_filters=base_filters or None,
+        )
+        total_est = probe.get("ProductsCount", 0)
+
+        if total_est <= API_MAX:
+            # 不需要分段
+            products = self.search_all(
+                keywords, category_id=category_id,
+                manufacturer_ids=manufacturer_ids,
+                parameter_filters=base_filters or None,
+                progress_callback=lambda c, t:
+                    progress_callback(c, t, "") if progress_callback else None,
+                stop_flag=stop_flag,
+            )
+            if segment_callback and products:
+                segment_callback(products)
+            return products, total_est
+
+        # 需要分段获取
+        all_products = []
+        segments_done = [0]
+        segments_total = [0]
+
+        def _fetch_segment(value_ids, depth=0):
+            """递归获取一个分段的结果"""
+            if not value_ids:
+                return
+            if stop_flag and stop_flag.is_set():
+                return
+
+            # 构建含分段参数的过滤器
+            seg_filters = list(base_filters)
+            seg_filters.append({
+                "ParameterId": split_param_id,
+                "FilterValues": [{"Id": vid} for vid in value_ids],
+            })
+
+            # 探测此分段的数量
+            probe = self.search_keyword(
+                keywords, limit=1, category_id=category_id,
+                manufacturer_ids=manufacturer_ids,
+                parameter_filters=seg_filters,
+            )
+            seg_total = probe.get("ProductsCount", 0)
+
+            if seg_total == 0:
+                segments_done[0] += 1
+                if progress_callback:
+                    progress_callback(
+                        len(all_products), total_est,
+                        f"Segment {segments_done[0]}/{segments_total[0]}: "
+                        f"empty, skipped")
+                return
+
+            if seg_total <= API_MAX or len(value_ids) <= 1:
+                # 可以完整获取（或无法再拆分）
+                products = self.search_all(
+                    keywords, category_id=category_id,
+                    manufacturer_ids=manufacturer_ids,
+                    parameter_filters=seg_filters,
+                    stop_flag=stop_flag,
+                )
+                all_products.extend(products)
+                segments_done[0] += 1
+                if progress_callback:
+                    progress_callback(
+                        len(all_products), total_est,
+                        f"Segment {segments_done[0]}/{segments_total[0]}: "
+                        f"+{len(products)}")
+                # 每个分段完成后立即回调，送出新数据
+                if segment_callback and products:
+                    segment_callback(products)
+                time.sleep(0.3)
+                return
+
+            # 分段仍然超过 300，二分递归
+            segments_total[0] += 1  # 拆分产生额外段
+            mid = len(value_ids) // 2
+            if progress_callback:
+                progress_callback(
+                    len(all_products), total_est,
+                    f"Segment too large ({seg_total}), splitting...")
+            _fetch_segment(value_ids[:mid], depth + 1)
+            _fetch_segment(value_ids[mid:], depth + 1)
+
+        # 初始切分：估算需要多少段
+        num_initial = max(2, (total_est + API_MAX - 1) // API_MAX)
+        batch_size = max(1, len(split_value_ids) // num_initial)
+        initial_batches = []
+        for i in range(0, len(split_value_ids), batch_size):
+            initial_batches.append(split_value_ids[i:i + batch_size])
+
+        segments_total[0] = len(initial_batches)
+
+        if progress_callback:
+            progress_callback(
+                0, total_est,
+                f"~{total_est} results, splitting into "
+                f"~{len(initial_batches)} segments...")
+
+        for batch in initial_batches:
+            if stop_flag and stop_flag.is_set():
+                break
+            _fetch_segment(batch)
+
+        return all_products, total_est
 
     def get_categories(self):
         """获取所有类别"""
@@ -694,7 +839,7 @@ def api_product_to_component(product):
     parameters = product.get("Parameters", [])
     for param in parameters:
         param_id = param.get("ParameterId", 0)
-        param_value = param.get("Value", "")
+        param_value = param.get("ValueText", "") or param.get("Value", "")
         param_name = param.get("ParameterText", "").lower()
 
         if param_id == 16 or "package" in param_name:
@@ -709,6 +854,15 @@ def api_product_to_component(product):
             comp.value = param_value
         elif "tolerance" in param_name and not comp.tolerance:
             comp.tolerance = param_value
+        elif param_id == 2 or ("power" in param_name and "watt" in param_name):
+            if not comp.power_rating:
+                comp.power_rating = param_value
+        elif param_id == 17 or "temperature coefficient" in param_name:
+            if not comp.temp_coeff:
+                comp.temp_coeff = param_value
+        elif param_id == 252 or "operating temperature" in param_name:
+            if not comp.operating_temp:
+                comp.operating_temp = param_value
         elif "voltage" in param_name and not comp.voltage_rating:
             comp.voltage_rating = param_value
 

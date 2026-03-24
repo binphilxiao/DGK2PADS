@@ -25,6 +25,9 @@ class Component:
         self.value = ""
         self.tolerance = ""
         self.voltage_rating = ""
+        self.power_rating = ""
+        self.temp_coeff = ""
+        self.operating_temp = ""
         self.category = ""
         self.ref_prefix = "U"       # 参考符号前缀 (R, C, L, U, etc.)
         self.pads_part_name = ""    # PADS 中的元件名

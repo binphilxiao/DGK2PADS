@@ -33,14 +33,16 @@ class Application(tk.Tk):
         super().__init__()
 
         self.title("DigiKey -> Mentor PADS Library Converter")
-        self.geometry("1050x800")
-        self.minsize(850, 650)
+        self.geometry("1280x900")
+        self.minsize(1000, 700)
 
         # Data
         self.components = []
         self.all_api_components = []  # unfiltered API results
         self.api_client = None
         self.api_products_raw = []
+
+        self._stop_event = threading.Event()
 
         # Common variables
         self.output_dir = tk.StringVar()
@@ -99,8 +101,9 @@ class Application(tk.Tk):
         frame_preview = ttk.LabelFrame(self, text="Component Preview", padding=5)
         frame_preview.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        columns = ("mfr_pn", "manufacturer", "description", "package_raw",
-                    "package", "ref", "pins", "value")
+        columns = ("mfr_pn", "manufacturer", "description", "value",
+                    "tolerance", "temp_coeff", "power", "operating_temp",
+                    "package")
         self.tree = ttk.Treeview(frame_preview, columns=columns, show="headings",
                                  selectmode="extended", height=10)
 
@@ -110,28 +113,31 @@ class Application(tk.Tk):
                           command=lambda: self._sort_tree("manufacturer"))
         self.tree.heading("description", text="Description",
                           command=lambda: self._sort_tree("description"))
-        self.tree.heading("package_raw", text="Raw Package",
-                          command=lambda: self._sort_tree("package_raw"))
-        self.tree.heading("package", text="Matched Pkg",
-                          command=lambda: self._sort_tree("package"))
-        self.tree.heading("ref", text="Ref",
-                          command=lambda: self._sort_tree("ref"))
-        self.tree.heading("pins", text="Pins",
-                          command=lambda: self._sort_tree("pins"))
-        self.tree.heading("value", text="Value",
+        self.tree.heading("value", text="Resistance",
                           command=lambda: self._sort_tree("value"))
+        self.tree.heading("tolerance", text="Tolerance",
+                          command=lambda: self._sort_tree("tolerance"))
+        self.tree.heading("temp_coeff", text="Temp Coeff",
+                          command=lambda: self._sort_tree("temp_coeff"))
+        self.tree.heading("power", text="Power (Watts)",
+                          command=lambda: self._sort_tree("power"))
+        self.tree.heading("operating_temp", text="Operating Temp",
+                          command=lambda: self._sort_tree("operating_temp"))
+        self.tree.heading("package", text="Package / Case",
+                          command=lambda: self._sort_tree("package"))
 
         self._sort_col = None    # current sort column
         self._sort_asc = True    # current sort direction
 
-        self.tree.column("mfr_pn", width=140, minwidth=80)
-        self.tree.column("manufacturer", width=100, minwidth=60)
-        self.tree.column("description", width=200, minwidth=100)
-        self.tree.column("package_raw", width=130, minwidth=60)
-        self.tree.column("package", width=80, minwidth=60)
-        self.tree.column("ref", width=40, minwidth=35)
-        self.tree.column("pins", width=40, minwidth=35)
-        self.tree.column("value", width=80, minwidth=50)
+        self.tree.column("mfr_pn", width=150, minwidth=80)
+        self.tree.column("manufacturer", width=90, minwidth=60)
+        self.tree.column("description", width=180, minwidth=100)
+        self.tree.column("value", width=90, minwidth=50)
+        self.tree.column("tolerance", width=70, minwidth=40)
+        self.tree.column("temp_coeff", width=90, minwidth=50)
+        self.tree.column("power", width=100, minwidth=50)
+        self.tree.column("operating_temp", width=120, minwidth=60)
+        self.tree.column("package", width=140, minwidth=60)
 
         scrollbar_y = ttk.Scrollbar(frame_preview, orient=tk.VERTICAL,
                                     command=self.tree.yview)
@@ -328,6 +334,9 @@ class Application(tk.Tk):
 
         ttk.Button(frame_btn, text="Search DigiKey",
                     command=self._api_search).pack(side=tk.LEFT, padx=(0, 10))
+        self.btn_stop = ttk.Button(frame_btn, text="Stop Fetch",
+                                    command=self._stop_search, state=tk.DISABLED)
+        self.btn_stop.pack(side=tk.LEFT, padx=(0, 10))
         ttk.Button(frame_btn, text="Test Connection",
                     command=self._api_test).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Button(frame_btn, text="Apply Filters",
@@ -557,6 +566,8 @@ class Application(tk.Tk):
                     "param_id": entry_info["param_id"],
                 }
 
+        self._stop_event.clear()
+        self.btn_stop.config(state=tk.NORMAL)
         self.progress.start(10)
         self.lbl_progress.config(text="Phase 1: Discovering filters...")
         self.lbl_api_status.config(text="Searching...", foreground="orange")
@@ -571,22 +582,6 @@ class Application(tk.Tk):
 
                 mfr_map, param_map, total_unfiltered = \
                     client.discover_filter_ids(keyword, category_id)
-
-                # Debug: dump discover results
-                try:
-                    import json as _json
-                    debug_path = os.path.join(os.path.dirname(__file__),
-                                               "_debug_discover.json")
-                    with open(debug_path, "w", encoding="utf-8") as f:
-                        _json.dump({
-                            "mfr_map_sample": dict(list(mfr_map.items())[:5]),
-                            "param_map_ids": list(param_map.keys()),
-                            "total_unfiltered": total_unfiltered,
-                            "user_mfr": mfr_name,
-                            "user_params": {k: v for k, v in user_param_selections.items()},
-                        }, f, indent=2, ensure_ascii=False)
-                except Exception:
-                    pass
 
                 # Match manufacturer
                 mfr_ids = None
@@ -642,36 +637,142 @@ class Application(tk.Tk):
                 self.after(0, lambda: self.lbl_progress.config(
                     text=f"Phase 2: Fetching results ({filter_info})..."))
 
-                def on_progress(current, total):
-                    self.after(0, lambda c=current, t=total:
-                               self.lbl_progress.config(
-                                   text=f"Fetched {c}/{t} results..."))
+                # Clear table and prepare for incremental display
+                skip_keys = server_matched_keys.copy()
+                skip_mfr = mfr_matched
+                self.after(0, lambda sk=skip_keys, sm=skip_mfr:
+                           self._prepare_incremental(sk, sm))
 
-                products = client.search_all(
+                def on_progress(fetched, total, msg):
+                    self.after(0, lambda f=fetched, t=total, m=msg:
+                               self.lbl_progress.config(
+                                   text=f"Fetched {f}/~{t}  {m}"))
+
+                def on_segment(new_products):
+                    """Called for each completed segment with new products"""
+                    self.after(0, lambda p=new_products:
+                               self._append_segment(p))
+
+                # Determine split parameter for segmented fetching
+                preset_name = self.combo_preset.get()
+                preset_cfg = SEARCH_PRESETS.get(preset_name, {})
+                split_param_id = preset_cfg.get("split_param_id")
+
+                # Get all value IDs for the split parameter
+                # (only if it's not already user-filtered)
+                split_value_ids = None
+                if split_param_id and split_param_id in param_map:
+                    # Check if user already filtered on this param
+                    already_filtered = any(
+                        f["ParameterId"] == split_param_id
+                        for f in api_param_filters
+                    )
+                    if not already_filtered:
+                        split_value_ids = list(
+                            param_map[split_param_id].values())
+
+                products, total_filtered = client.search_all_segmented(
                     search_keyword,
                     category_id=category_id,
                     manufacturer_ids=mfr_ids,
                     parameter_filters=api_param_filters if api_param_filters
                     else None,
+                    split_param_id=split_param_id,
+                    split_value_ids=split_value_ids,
                     progress_callback=on_progress,
+                    segment_callback=on_segment,
+                    stop_flag=self._stop_event,
                 )
 
-                components = convert_api_results(products)
-                # Remember which filters were already applied server-side
-                skip_keys = server_matched_keys.copy()
-                skip_mfr = mfr_matched
-                self.after(0, lambda fi=filter_info, tu=total_unfiltered,
-                           sk=skip_keys, sm=skip_mfr:
-                           self._on_api_search_done(
-                               products, components, fi, tu, sk, sm))
+                # Final: update status
+                stopped = self._stop_event.is_set()
+                self.after(0, lambda fi=filter_info, tf=total_filtered, s=stopped:
+                           self._on_search_finished(fi, tf, stopped=s))
 
             except DigiKeyAPIError as e:
                 self.after(0, lambda err=str(e): self._on_api_search_fail(err))
 
         threading.Thread(target=do_search, daemon=True).start()
 
+    def _prepare_incremental(self, skip_keys, skip_mfr):
+        """Clear table and prepare for incremental segment display"""
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self.components = []
+        self.all_api_components = []
+        self.api_products_raw = []
+        self._incremental_skip_keys = skip_keys
+        self._incremental_skip_mfr = skip_mfr
+
+    def _append_segment(self, new_products):
+        """Append a batch of new products to the table incrementally"""
+        from digikey_api import convert_api_results
+        new_comps = convert_api_results(new_products)
+
+        # Apply client-side filters on new batch
+        filtered = self._filter_components(
+            new_comps,
+            skip_keys=getattr(self, '_incremental_skip_keys', set()),
+            skip_mfr=getattr(self, '_incremental_skip_mfr', False))
+
+        self.all_api_components.extend(new_comps)
+        self.api_products_raw.extend(new_products)
+        self.components.extend(filtered)
+
+        # Append rows to table (no full refresh - just add new)
+        for comp in filtered:
+            self.tree.insert("", tk.END, values=(
+                comp.mfr_pn,
+                comp.manufacturer,
+                (comp.description[:55] + "...") if len(comp.description) > 55
+                else comp.description,
+                comp.value,
+                comp.tolerance,
+                comp.temp_coeff,
+                comp.power_rating,
+                comp.operating_temp,
+                comp.package_raw,
+            ))
+
+        # Update stats
+        total = len(self.components)
+        groups = group_by_package(self.components)
+        matched = sum(1 for c in self.components if get_footprint(c.package))
+        self.lbl_stats.config(
+            text=f"Total: {total} components, {len(groups)} packages, "
+                 f"Matched: {matched}, Generic: {total - matched}")
+        self.lbl_api_status.config(
+            text=f"Fetching... {total} components so far",
+            foreground="orange")
+
+    def _stop_search(self):
+        """Signal the background search thread to stop"""
+        self._stop_event.set()
+        self.btn_stop.config(state=tk.DISABLED)
+        self.lbl_progress.config(text="Stopping...")
+
+    def _on_search_finished(self, filter_info, total_filtered, stopped=False):
+        """Called when segmented search is fully complete"""
+        self.progress.stop()
+        self.lbl_progress.config(text="")
+        self.btn_stop.config(state=tk.DISABLED)
+        total = len(self.components)
+        total_all = len(self.all_api_components)
+
+        status_prefix = "Stopped" if stopped else "Done"
+        if total < total_all:
+            self.lbl_api_status.config(
+                text=f"{status_prefix}: {total_all} fetched (of ~{total_filtered} matching), "
+                     f"{total} after client filters. [{filter_info}]",
+                foreground="green" if total else "orange")
+        else:
+            self.lbl_api_status.config(
+                text=f"{status_prefix}: {total} components "
+                     f"(of ~{total_filtered} matching). [{filter_info}]",
+                foreground="green")
+
     def _on_api_search_done(self, products, components,
-                            filter_info="", total_unfiltered=0,
+                            filter_info="", total_filtered=0,
                             server_matched_keys=None,
                             server_matched_mfr=False):
         """API search completed - apply remaining client-side filters"""
@@ -697,14 +798,14 @@ class Application(tk.Tk):
                 foreground="orange")
         elif len(filtered) < len(components):
             self.lbl_api_status.config(
-                text=f"Total ~{total_unfiltered}, API returned {len(components)}, "
+                text=f"Fetched {len(components)} (of ~{total_filtered} matching), "
                      f"{len(filtered)} after client filters. "
                      f"[{filter_info}]",
                 foreground="green" if filtered else "orange")
         else:
             self.lbl_api_status.config(
                 text=f"Done: {len(components)} components "
-                     f"(of ~{total_unfiltered} total). [{filter_info}]",
+                     f"(of ~{total_filtered} matching). [{filter_info}]",
                 foreground="green")
 
         self._refresh_preview()
@@ -800,6 +901,7 @@ class Application(tk.Tk):
         """API search failed"""
         self.progress.stop()
         self.lbl_progress.config(text="")
+        self.btn_stop.config(state=tk.DISABLED)
         self.lbl_api_status.config(text="Search failed", foreground="red")
         messagebox.showerror("Search Failed",
                              f"DigiKey API search error:\n\n{error}")
@@ -847,16 +949,8 @@ class Application(tk.Tk):
         items = [(self.tree.set(iid, col), iid)
                  for iid in self.tree.get_children()]
 
-        # Try numeric sort for 'pins' column
-        if col == "pins":
-            def sort_key(item):
-                try:
-                    return int(item[0])
-                except (ValueError, TypeError):
-                    return 0
-            items.sort(key=sort_key, reverse=not self._sort_asc)
-        else:
-            items.sort(key=lambda x: x[0].lower(), reverse=not self._sort_asc)
+        # Sort items
+        items.sort(key=lambda x: x[0].lower(), reverse=not self._sort_asc)
 
         # Rearrange items in treeview
         for idx, (_, iid) in enumerate(items):
@@ -865,9 +959,10 @@ class Application(tk.Tk):
         # Update heading to show sort indicator
         col_names = {
             "mfr_pn": "MFR P/N", "manufacturer": "Manufacturer",
-            "description": "Description", "package_raw": "Raw Package",
-            "package": "Matched Pkg", "ref": "Ref",
-            "pins": "Pins", "value": "Value",
+            "description": "Description", "value": "Resistance",
+            "tolerance": "Tolerance", "temp_coeff": "Temp Coefficient",
+            "power": "Power (Watts)", "operating_temp": "Operating Temp",
+            "package": "Package / Case",
         }
         for c, name in col_names.items():
             if c == col:
@@ -881,27 +976,23 @@ class Application(tk.Tk):
         for item in self.tree.get_children():
             self.tree.delete(item)
 
-        matched = 0
         for comp in self.components:
-            fp = get_footprint(comp.package)
-            pkg_status = comp.package if fp else f"{comp.package} (?)"
-            if fp:
-                matched += 1
-
             self.tree.insert("", tk.END, values=(
                 comp.mfr_pn,
                 comp.manufacturer,
                 (comp.description[:55] + "...") if len(comp.description) > 55
                 else comp.description,
-                comp.package_raw,
-                pkg_status,
-                comp.ref_prefix,
-                comp.pin_count,
                 comp.value,
+                comp.tolerance,
+                comp.temp_coeff,
+                comp.power_rating,
+                comp.operating_temp,
+                comp.package_raw,
             ))
 
         total = len(self.components)
         groups = group_by_package(self.components)
+        matched = sum(1 for c in self.components if get_footprint(c.package))
         self.lbl_stats.config(
             text=f"Total: {total} components, {len(groups)} packages, "
                  f"Matched: {matched}, Generic: {total - matched}")
