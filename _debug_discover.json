@@ -1,0 +1,41 @@
+{
+  "mfr_map_sample": {
+    "aillen": 600470,
+    "american technical ceramics": 1284,
+    "arcol": 600261,
+    "bourns inc.": 118,
+    "c&b/resi": 4506
+  },
+  "param_map_ids": [
+    2085,
+    3,
+    2,
+    174,
+    5,
+    17,
+    252,
+    16,
+    1291,
+    707,
+    46,
+    1500,
+    1127,
+    1531
+  ],
+  "total_unfiltered": 1206814,
+  "user_mfr": "Yageo",
+  "user_params": {
+    "package": {
+      "value": "0603",
+      "param_id": 16
+    },
+    "power_rating": {
+      "value": "1/10W",
+      "param_id": 2
+    },
+    "tolerance": {
+      "value": "±1%",
+      "param_id": 3
+    }
+  }
+}

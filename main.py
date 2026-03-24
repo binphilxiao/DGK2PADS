@@ -56,7 +56,6 @@ class Application(tk.Tk):
         self.api_use_sandbox = tk.BooleanVar(value=False)
         self.api_keyword = tk.StringVar()
         self.api_category_var = tk.StringVar()
-        self.api_max_results = tk.IntVar(value=50)
         self.api_manufacturer_var = tk.StringVar()
         self.api_param_entries = {}  # parameter filter widgets
 
@@ -105,14 +104,25 @@ class Application(tk.Tk):
         self.tree = ttk.Treeview(frame_preview, columns=columns, show="headings",
                                  selectmode="extended", height=10)
 
-        self.tree.heading("mfr_pn", text="MFR P/N")
-        self.tree.heading("manufacturer", text="Manufacturer")
-        self.tree.heading("description", text="Description")
-        self.tree.heading("package_raw", text="Raw Package")
-        self.tree.heading("package", text="Matched Pkg")
-        self.tree.heading("ref", text="Ref")
-        self.tree.heading("pins", text="Pins")
-        self.tree.heading("value", text="Value")
+        self.tree.heading("mfr_pn", text="MFR P/N",
+                          command=lambda: self._sort_tree("mfr_pn"))
+        self.tree.heading("manufacturer", text="Manufacturer",
+                          command=lambda: self._sort_tree("manufacturer"))
+        self.tree.heading("description", text="Description",
+                          command=lambda: self._sort_tree("description"))
+        self.tree.heading("package_raw", text="Raw Package",
+                          command=lambda: self._sort_tree("package_raw"))
+        self.tree.heading("package", text="Matched Pkg",
+                          command=lambda: self._sort_tree("package"))
+        self.tree.heading("ref", text="Ref",
+                          command=lambda: self._sort_tree("ref"))
+        self.tree.heading("pins", text="Pins",
+                          command=lambda: self._sort_tree("pins"))
+        self.tree.heading("value", text="Value",
+                          command=lambda: self._sort_tree("value"))
+
+        self._sort_col = None    # current sort column
+        self._sort_asc = True    # current sort direction
 
         self.tree.column("mfr_pn", width=140, minwidth=80)
         self.tree.column("manufacturer", width=100, minwidth=60)
@@ -260,12 +270,6 @@ class Application(tk.Tk):
         self.combo_preset.set("Chip Resistor")
         self.combo_preset.grid(row=row, column=1, sticky=tk.W, padx=5)
         self.combo_preset.bind("<<ComboboxSelected>>", self._on_preset_changed)
-
-        ttk.Label(frame_search, text="Max Results:").grid(
-            row=row, column=2, sticky=tk.W, padx=(20, 5))
-        ttk.Spinbox(frame_search, from_=10, to=500, increment=10,
-                     textvariable=self.api_max_results, width=8).grid(
-            row=row, column=3, sticky=tk.W, padx=5)
 
         # Keyword
         row += 1
@@ -482,8 +486,51 @@ class Application(tk.Tk):
         messagebox.showerror("API Connection Failed",
                              f"Cannot connect to DigiKey API:\n\n{err}")
 
+    def _build_search_keyword(self):
+        """Build base search keyword (without filter terms, those go to API filters)."""
+        return self.api_keyword.get().strip()
+
+    def _match_filter_value(self, user_val, available_values):
+        """Match a user-selected filter value to an API ValueId.
+        available_values: {value_text_lower: value_id}
+        Returns matched value_id or None.
+        """
+        val_lower = user_val.lower().strip()
+        # Exact match
+        if val_lower in available_values:
+            return available_values[val_lower]
+        # Try with ± prefix for tolerance values (user "1%" -> "±1%")
+        if val_lower and not val_lower.startswith('±'):
+            prefixed = '±' + val_lower
+            if prefixed in available_values:
+                return available_values[prefixed]
+        # Substring match on comma-separated alternatives
+        # e.g., user "1/10W" matches "0.1w, 1/10w"
+        best_match = None
+        best_len = float('inf')
+        for vname, vid in available_values.items():
+            # Check each comma-separated part
+            parts = [p.strip() for p in vname.split(',')]
+            for part in parts:
+                if val_lower == part:
+                    return vid  # exact match on a part
+            # Prefix match: "0603" matches "0603 (1608 metric)"
+            if vname.startswith(val_lower + ' ') or vname.startswith(val_lower + '('):
+                if len(vname) < best_len:
+                    best_match = vid
+                    best_len = len(vname)
+            # Check if user value appears as standalone in the name
+            if val_lower in vname and len(vname) < best_len:
+                # Avoid false positives: "1%" matching "0.1%"
+                # Only match if val appears at word boundary
+                import re
+                if re.search(r'(?:^|[\s,±])' + re.escape(val_lower) + r'(?:$|[\s,)])', vname):
+                    best_match = vid
+                    best_len = len(vname)
+        return best_match
+
     def _api_search(self):
-        """Execute API search"""
+        """Execute API search with server-side filtering (two-phase)"""
         try:
             client = self._get_api_client()
         except DigiKeyAPIError as e:
@@ -499,23 +546,101 @@ class Application(tk.Tk):
         cat_name = self.combo_category.get()
         category_id = DIGIKEY_CATEGORIES.get(cat_name)
 
-        # Append manufacturer name to keyword so API returns
-        # manufacturer-biased results (API has no name-based mfr filter)
+        # Collect user filter selections
         mfr_name = self.api_manufacturer_var.get().strip()
-        if mfr_name:
-            search_keyword = f"{keyword} {mfr_name}"
-        else:
-            search_keyword = keyword
-
-        max_results = self.api_max_results.get()
+        user_param_selections = {}
+        for key, entry_info in self.api_param_entries.items():
+            val = entry_info["var"].get().strip()
+            if val:
+                user_param_selections[key] = {
+                    "value": val,
+                    "param_id": entry_info["param_id"],
+                }
 
         self.progress.start(10)
-        self.lbl_progress.config(text="Searching...")
+        self.lbl_progress.config(text="Phase 1: Discovering filters...")
         self.lbl_api_status.config(text="Searching...", foreground="orange")
 
         def do_search():
             try:
                 client._ensure_auth()
+
+                # Phase 1: Discover available filter IDs
+                self.after(0, lambda: self.lbl_progress.config(
+                    text="Phase 1: Discovering available filters..."))
+
+                mfr_map, param_map, total_unfiltered = \
+                    client.discover_filter_ids(keyword, category_id)
+
+                # Debug: dump discover results
+                try:
+                    import json as _json
+                    debug_path = os.path.join(os.path.dirname(__file__),
+                                               "_debug_discover.json")
+                    with open(debug_path, "w", encoding="utf-8") as f:
+                        _json.dump({
+                            "mfr_map_sample": dict(list(mfr_map.items())[:5]),
+                            "param_map_ids": list(param_map.keys()),
+                            "total_unfiltered": total_unfiltered,
+                            "user_mfr": mfr_name,
+                            "user_params": {k: v for k, v in user_param_selections.items()},
+                        }, f, indent=2, ensure_ascii=False)
+                except Exception:
+                    pass
+
+                # Match manufacturer
+                mfr_ids = None
+                mfr_matched = False
+                if mfr_name:
+                    mfr_lower = mfr_name.lower()
+                    if mfr_lower in mfr_map:
+                        mfr_ids = [mfr_map[mfr_lower]]
+                        mfr_matched = True
+
+                # Match parameter filters to API ValueIds
+                api_param_filters = []
+                unmatched_params = {}  # for client-side fallback
+                server_matched_keys = set()  # keys handled server-side
+                for key, sel in user_param_selections.items():
+                    param_id = sel["param_id"]
+                    val = sel["value"]
+                    if param_id in param_map:
+                        vid = self._match_filter_value(val, param_map[param_id])
+                        if vid:
+                            api_param_filters.append({
+                                "ParameterId": param_id,
+                                "FilterValues": [{"Id": vid}],
+                            })
+                            server_matched_keys.add(key)
+                            continue
+                    # Not matched - will do client-side
+                    unmatched_params[key] = sel
+
+                # Build search keyword: add unmatched terms to keyword
+                kw_parts = [keyword]
+                if mfr_name and not mfr_matched:
+                    kw_parts.append(mfr_name)
+                for key, sel in unmatched_params.items():
+                    kw_parts.append(sel["value"])
+                search_keyword = " ".join(kw_parts)
+
+                # Build info string
+                filter_info_parts = []
+                if mfr_matched:
+                    filter_info_parts.append(f"Mfr={mfr_name}")
+                if api_param_filters:
+                    filter_info_parts.append(
+                        f"{len(api_param_filters)} param filter(s)")
+                if unmatched_params:
+                    filter_info_parts.append(
+                        f"{len(unmatched_params)} client-side")
+
+                filter_info = ", ".join(filter_info_parts) if \
+                    filter_info_parts else "keyword only"
+
+                # Phase 2: Real search with server-side filters
+                self.after(0, lambda: self.lbl_progress.config(
+                    text=f"Phase 2: Fetching results ({filter_info})..."))
 
                 def on_progress(current, total):
                     self.after(0, lambda c=current, t=total:
@@ -524,30 +649,43 @@ class Application(tk.Tk):
 
                 products = client.search_all(
                     search_keyword,
-                    max_results=max_results,
                     category_id=category_id,
+                    manufacturer_ids=mfr_ids,
+                    parameter_filters=api_param_filters if api_param_filters
+                    else None,
                     progress_callback=on_progress,
                 )
 
                 components = convert_api_results(products)
-                self.after(0, lambda: self._on_api_search_done(
-                    products, components))
+                # Remember which filters were already applied server-side
+                skip_keys = server_matched_keys.copy()
+                skip_mfr = mfr_matched
+                self.after(0, lambda fi=filter_info, tu=total_unfiltered,
+                           sk=skip_keys, sm=skip_mfr:
+                           self._on_api_search_done(
+                               products, components, fi, tu, sk, sm))
 
             except DigiKeyAPIError as e:
                 self.after(0, lambda err=str(e): self._on_api_search_fail(err))
 
         threading.Thread(target=do_search, daemon=True).start()
 
-    def _on_api_search_done(self, products, components):
-        """API search completed - auto-apply filters and show results"""
+    def _on_api_search_done(self, products, components,
+                            filter_info="", total_unfiltered=0,
+                            server_matched_keys=None,
+                            server_matched_mfr=False):
+        """API search completed - apply remaining client-side filters"""
         self.progress.stop()
         self.lbl_progress.config(text="")
 
         self.api_products_raw = products
         self.all_api_components = components  # save unfiltered
 
-        # Auto-apply client-side filters (manufacturer, parameters, etc.)
-        filtered = self._filter_components(components)
+        # Auto-apply client-side filters only for params NOT already server-side
+        filtered = self._filter_components(
+            components,
+            skip_keys=server_matched_keys or set(),
+            skip_mfr=server_matched_mfr)
         self.components = filtered
 
         # Detect sandbox dummy data
@@ -558,32 +696,32 @@ class Application(tk.Tk):
                      f"Uncheck 'Sandbox' for real results.",
                 foreground="orange")
         elif len(filtered) < len(components):
-            # Show filter step diagnostics
-            filter_detail = ""
-            if hasattr(self, '_filter_log') and self._filter_log:
-                filter_detail = "  |  " + ", ".join(self._filter_log)
-
             self.lbl_api_status.config(
-                text=f"Done: {len(components)} found, "
-                     f"{len(filtered)} after filters."
-                     f"{filter_detail}",
+                text=f"Total ~{total_unfiltered}, API returned {len(components)}, "
+                     f"{len(filtered)} after client filters. "
+                     f"[{filter_info}]",
                 foreground="green" if filtered else "orange")
         else:
             self.lbl_api_status.config(
-                text=f"Done: {len(components)} components found. "
-                     f"Use 'Apply Filters' to narrow down.",
+                text=f"Done: {len(components)} components "
+                     f"(of ~{total_unfiltered} total). [{filter_info}]",
                 foreground="green")
 
         self._refresh_preview()
 
-    def _filter_components(self, components):
-        """Apply client-side filters (manufacturer + parameter dropdowns)"""
+    def _filter_components(self, components, skip_keys=None, skip_mfr=False):
+        """Apply client-side filters (manufacturer + parameter dropdowns)
+        skip_keys: set of param keys already filtered server-side
+        skip_mfr: True if manufacturer was filtered server-side
+        """
+        if skip_keys is None:
+            skip_keys = set()
         filtered = list(components)
         self._filter_log = []  # diagnostic log
 
-        # Manufacturer filter
+        # Manufacturer filter (skip if already done server-side)
         mfr_filter = self.api_manufacturer_var.get().strip().lower()
-        if mfr_filter:
+        if mfr_filter and not skip_mfr:
             before = len(filtered)
             filtered = [c for c in filtered
                         if mfr_filter in c.manufacturer.lower()]
@@ -594,8 +732,10 @@ class Application(tk.Tk):
         def _in_desc(comp, val):
             return val in comp.description.lower().replace(" ", "")
 
-        # Parameter filters
+        # Parameter filters (skip those already applied server-side)
         for key, entry_info in self.api_param_entries.items():
+            if key in skip_keys:
+                continue
             val = entry_info["var"].get().strip()
             if not val:
                 continue
@@ -694,6 +834,48 @@ class Application(tk.Tk):
     # ============================================================
     # Common Methods
     # ============================================================
+    def _sort_tree(self, col):
+        """Sort treeview by column header click"""
+        # Toggle direction if same column clicked again
+        if self._sort_col == col:
+            self._sort_asc = not self._sort_asc
+        else:
+            self._sort_col = col
+            self._sort_asc = True
+
+        # Get all rows with values
+        items = [(self.tree.set(iid, col), iid)
+                 for iid in self.tree.get_children()]
+
+        # Try numeric sort for 'pins' column
+        if col == "pins":
+            def sort_key(item):
+                try:
+                    return int(item[0])
+                except (ValueError, TypeError):
+                    return 0
+            items.sort(key=sort_key, reverse=not self._sort_asc)
+        else:
+            items.sort(key=lambda x: x[0].lower(), reverse=not self._sort_asc)
+
+        # Rearrange items in treeview
+        for idx, (_, iid) in enumerate(items):
+            self.tree.move(iid, "", idx)
+
+        # Update heading to show sort indicator
+        col_names = {
+            "mfr_pn": "MFR P/N", "manufacturer": "Manufacturer",
+            "description": "Description", "package_raw": "Raw Package",
+            "package": "Matched Pkg", "ref": "Ref",
+            "pins": "Pins", "value": "Value",
+        }
+        for c, name in col_names.items():
+            if c == col:
+                arrow = " \u25b2" if self._sort_asc else " \u25bc"
+                self.tree.heading(c, text=name + arrow)
+            else:
+                self.tree.heading(c, text=name)
+
     def _refresh_preview(self):
         """Refresh preview table"""
         for item in self.tree.get_children():

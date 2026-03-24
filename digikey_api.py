@@ -59,9 +59,9 @@ DIGIKEY_CATEGORIES = {
 COMMON_PARAMETER_IDS = {
     # 电阻
     "resistance": 2085,          # 阻值
-    "power_rating": 2087,        # 功率
+    "power_rating": 2,           # 功率 (Power (Watts))
     "tolerance_res": 3,          # 容差
-    "temperature_coeff": 2086,   # 温度系数
+    "temperature_coeff": 17,     # 温度系数
 
     # 电容
     "capacitance": 2049,         # 容值
@@ -103,12 +103,12 @@ RESISTOR_SEARCH_CONFIG = {
         {"name": "Package", "key": "package", "param_id": 16,
          "values": ["", "01005", "0201", "0402", "0603", "0805",
                     "1206", "1210", "2010", "2512"]},
-        {"name": "Power Rating", "key": "power_rating", "param_id": 2087,
+        {"name": "Power Rating", "key": "power_rating", "param_id": 2,
          "values": ["", "1/32W", "1/20W", "1/16W", "1/10W",
                     "1/8W", "1/4W", "1/2W", "1W", "2W"]},
         {"name": "Tolerance", "key": "tolerance", "param_id": 3,
-         "values": ["", "0.1%", "0.25%", "0.5%", "1%", "2%", "5%", "10%"]},
-        {"name": "Temp Coefficient", "key": "temp_coeff", "param_id": 2086,
+         "values": ["", "±0.1%", "±0.25%", "±0.5%", "±1%", "±2%", "±5%", "±10%"]},
+        {"name": "Temp Coefficient", "key": "temp_coeff", "param_id": 17,
          "values": ["", "10ppm/C", "25ppm/C", "50ppm/C",
                     "100ppm/C", "200ppm/C"]},
     ],
@@ -508,10 +508,10 @@ class DigiKeyClient:
 
         if manufacturer_ids:
             filter_opts["ManufacturerFilter"] = [
-                {"Id": str(mid)} for mid in manufacturer_ids
+                {"Id": mid} for mid in manufacturer_ids
             ]
 
-        # 参数过滤器
+        # 参数过滤器 (V4 API 格式)
         if parameter_filters and category_id:
             filter_opts["ParameterFilterRequest"] = {
                 "CategoryFilter": {"Id": str(category_id)},
@@ -521,31 +521,50 @@ class DigiKeyClient:
         if filter_opts:
             body["FilterOptionsRequest"] = filter_opts
 
+        # Debug: dump first request body for inspection
+        if offset == 0:
+            try:
+                debug_path = os.path.join(os.path.dirname(__file__),
+                                           "_debug_request.json")
+                with open(debug_path, "w", encoding="utf-8") as f:
+                    json.dump(body, f, indent=2, ensure_ascii=False)
+            except Exception:
+                pass
+
         result = self._make_request(url, method="POST", data=body,
                                      headers=self._api_headers())
         return result
 
-    def search_all(self, keywords, max_results=200, category_id=None,
+    def search_all(self, keywords, category_id=None,
                    manufacturer_ids=None, parameter_filters=None,
                    progress_callback=None):
         """
         搜索并获取所有结果（自动翻页）
 
+        DigiKey API 限制 Offset + Limit <= 300，因此单次搜索最多 300 条。
+
         Args:
             keywords: 搜索关键字
-            max_results: 最大结果数
             category_id, manufacturer_ids, parameter_filters: 过滤条件
             progress_callback: 进度回调 fn(current, total)
 
         Returns:
             list[dict]: 所有产品列表
         """
+        API_MAX_OFFSET = 300  # DigiKey hard limit: Offset + Limit <= 300
         all_products = []
         offset = 0
         total = None
         page_size = 50
 
         while True:
+            # Ensure we don't exceed API limit
+            if offset + page_size > API_MAX_OFFSET:
+                remaining = API_MAX_OFFSET - offset
+                if remaining <= 0:
+                    break
+                page_size = remaining
+
             result = self.search_keyword(
                 keywords, limit=page_size, offset=offset,
                 category_id=category_id,
@@ -560,20 +579,24 @@ class DigiKeyClient:
             all_products.extend(products)
 
             if progress_callback and total:
-                progress_callback(len(all_products), min(total, max_results))
+                progress_callback(len(all_products),
+                                  min(total, API_MAX_OFFSET))
 
-            offset += page_size
+            offset += len(products)
 
-            if len(products) < page_size or len(all_products) >= max_results:
+            if len(products) < page_size:
                 break
 
             if total and offset >= total:
                 break
 
+            if offset >= API_MAX_OFFSET:
+                break
+
             # 遵守速率限制
             time.sleep(0.5)
 
-        return all_products[:max_results]
+        return all_products
 
     def get_categories(self):
         """获取所有类别"""
@@ -594,7 +617,52 @@ class DigiKeyClient:
         """
         result = self.search_keyword(keywords, limit=1,
                                       category_id=category_id)
-        return result.get("FilterOptions", {})
+        return result
+
+    def discover_filter_ids(self, keywords, category_id=None):
+        """
+        预搜索以获取可用的过滤选项 ID（制造商 ID、参数值 ID）。
+
+        Returns:
+            tuple: (manufacturer_map, param_value_map, total_count)
+                manufacturer_map: {name_lower: id}
+                param_value_map: {param_id: {value_text_lower: value_id}}
+                total_count: 总匹配数
+        """
+        result = self.search_keyword(keywords, limit=1,
+                                      category_id=category_id)
+        total_count = result.get("ProductsCount", 0)
+        filter_options = result.get("FilterOptions", {})
+
+        # 解析制造商列表
+        # V4 API 格式: {"Id": 13, "Value": "YAGEO", "ProductCount": ...}
+        manufacturer_map = {}
+        mfr_list = filter_options.get("Manufacturers", [])
+        for mfr in mfr_list:
+            name = mfr.get("Value", "")
+            mid = mfr.get("Id")
+            if name and mid is not None:
+                manufacturer_map[name.lower()] = mid
+
+        # 解析参数过滤选项
+        # V4 API 格式: [{"ParameterId": 3, "ParameterName": "Tolerance",
+        #   "FilterValues": [{"ValueId": "1131", "ValueName": "±1%"}, ...]}]
+        param_value_map = {}
+        param_section = filter_options.get("ParametricFilters", [])
+
+        for pf in param_section:
+            param_id = pf.get("ParameterId")
+            values = pf.get("FilterValues", [])
+            value_map = {}
+            for v in values:
+                vname = v.get("ValueName", "")
+                vid = v.get("ValueId")
+                if vname and vid is not None:
+                    value_map[vname.lower()] = str(vid)
+            if param_id is not None and value_map:
+                param_value_map[int(param_id)] = value_map
+
+        return manufacturer_map, param_value_map, total_count
 
 
 def api_product_to_component(product):

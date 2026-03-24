@@ -1,0 +1,49 @@
+{
+  "Keywords": "resistor",
+  "Limit": 50,
+  "Offset": 0,
+  "ExcludeMarketPlaceProducts": true,
+  "FilterOptionsRequest": {
+    "CategoryFilter": [
+      {
+        "Id": "52"
+      }
+    ],
+    "ManufacturerFilter": [
+      {
+        "Id": 13
+      }
+    ],
+    "ParameterFilterRequest": {
+      "CategoryFilter": {
+        "Id": "52"
+      },
+      "ParameterFilters": [
+        {
+          "ParameterId": 16,
+          "FilterValues": [
+            {
+              "Id": "39246"
+            }
+          ]
+        },
+        {
+          "ParameterId": 2,
+          "FilterValues": [
+            {
+              "Id": "14064"
+            }
+          ]
+        },
+        {
+          "ParameterId": 3,
+          "FilterValues": [
+            {
+              "Id": "1131"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
