@@ -91,6 +91,14 @@ COMMON_MANUFACTURERS = [
     "Diodes Incorporated", "Littelfuse", "Taiyo Yuden",
 ]
 
+# Common resistor series for dropdown
+COMMON_RESISTOR_SERIES = [
+    "", "RC_L", "RT_L", "AC", "AA", "AT",
+    "ERJ", "CRCW", "MCR", "RK73H", "RK73B",
+    "CR", "RMCF", "RC", "RR", "RG",
+    "TNPW", "WSL",
+]
+
 # Resistor search preset
 RESISTOR_SEARCH_CONFIG = {
     "category_name": "Chip Resistor - Surface Mount",
@@ -829,6 +837,13 @@ def api_product_to_component(product):
     mfr = product.get("Manufacturer", {})
     comp.manufacturer = mfr.get("Name", "")
     comp.mfr_pn = product.get("ManufacturerProductNumber", "")
+
+    # Series
+    series_info = product.get("Series", {})
+    if isinstance(series_info, dict):
+        comp.series = series_info.get("Name", "")
+    elif isinstance(series_info, str):
+        comp.series = series_info
 
     # DigiKey 料号（取第一个变体）
     variations = product.get("ProductVariations", [])

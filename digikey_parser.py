@@ -17,6 +17,7 @@ class Component:
         self.digikey_pn = ""
         self.mfr_pn = ""
         self.manufacturer = ""
+        self.series = ""
         self.description = ""
         self.package_raw = ""
         self.package = ""           # 标准化后的封装名

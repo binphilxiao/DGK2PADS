@@ -59,6 +59,7 @@ class Application(tk.Tk):
         self.api_keyword = tk.StringVar()
         self.api_category_var = tk.StringVar()
         self.api_manufacturer_var = tk.StringVar()
+        self.api_series_var = tk.StringVar()
         self.api_param_entries = {}  # parameter filter widgets
 
         self._load_saved_config()
@@ -101,7 +102,7 @@ class Application(tk.Tk):
         frame_preview = ttk.LabelFrame(self, text="Component Preview", padding=5)
         frame_preview.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        columns = ("mfr_pn", "manufacturer", "description", "value",
+        columns = ("mfr_pn", "manufacturer", "series", "description", "value",
                     "tolerance", "temp_coeff", "power", "operating_temp",
                     "package")
         self.tree = ttk.Treeview(frame_preview, columns=columns, show="headings",
@@ -111,6 +112,8 @@ class Application(tk.Tk):
                           command=lambda: self._sort_tree("mfr_pn"))
         self.tree.heading("manufacturer", text="Manufacturer",
                           command=lambda: self._sort_tree("manufacturer"))
+        self.tree.heading("series", text="Series",
+                          command=lambda: self._sort_tree("series"))
         self.tree.heading("description", text="Description",
                           command=lambda: self._sort_tree("description"))
         self.tree.heading("value", text="Resistance",
@@ -131,6 +134,7 @@ class Application(tk.Tk):
 
         self.tree.column("mfr_pn", width=150, minwidth=80)
         self.tree.column("manufacturer", width=90, minwidth=60)
+        self.tree.column("series", width=80, minwidth=50)
         self.tree.column("description", width=180, minwidth=100)
         self.tree.column("value", width=90, minwidth=50)
         self.tree.column("tolerance", width=70, minwidth=40)
@@ -306,6 +310,20 @@ class Application(tk.Tk):
         self.combo_manufacturer.grid(row=row, column=1, columnspan=3,
                                       sticky=tk.W, padx=5, pady=(5, 0))
 
+        # Series dropdown (shown for resistors)
+        row += 1
+        self.lbl_series = ttk.Label(frame_search, text="Series:")
+        self.lbl_series.grid(row=row, column=0, sticky=tk.W, padx=(0, 5), pady=(5, 0))
+        self.combo_series = ttk.Combobox(
+            frame_search, textvariable=self.api_series_var,
+            values=[], width=40)
+        self.combo_series.set("")
+        self.combo_series.grid(row=row, column=1, columnspan=3,
+                               sticky=tk.W, padx=5, pady=(5, 0))
+        # Initially hidden
+        self.lbl_series.grid_remove()
+        self.combo_series.grid_remove()
+
         # Parameter filter area
         row += 1
         ttk.Separator(frame_search, orient=tk.HORIZONTAL).grid(
@@ -353,7 +371,17 @@ class Application(tk.Tk):
             widget.destroy()
         self.api_param_entries.clear()
 
+        # Show/hide Series dropdown based on preset
         preset_name = self.combo_preset.get()
+        if preset_name == "Chip Resistor":
+            from digikey_api import COMMON_RESISTOR_SERIES
+            self.combo_series.config(values=COMMON_RESISTOR_SERIES)
+            self.lbl_series.grid()
+            self.combo_series.grid()
+        else:
+            self.api_series_var.set("")
+            self.lbl_series.grid_remove()
+            self.combo_series.grid_remove()
         if preset_name in SEARCH_PRESETS:
             config = SEARCH_PRESETS[preset_name]
             self.api_keyword.set(config["keyword"])
@@ -615,6 +643,10 @@ class Application(tk.Tk):
                 kw_parts = [keyword]
                 if mfr_name and not mfr_matched:
                     kw_parts.append(mfr_name)
+                # Add series to keyword for server-side narrowing
+                series_name = self.api_series_var.get().strip()
+                if series_name:
+                    kw_parts.append(series_name)
                 for key, sel in unmatched_params.items():
                     kw_parts.append(sel["value"])
                 search_keyword = " ".join(kw_parts)
@@ -623,6 +655,8 @@ class Application(tk.Tk):
                 filter_info_parts = []
                 if mfr_matched:
                     filter_info_parts.append(f"Mfr={mfr_name}")
+                if series_name:
+                    filter_info_parts.append(f"Series={series_name}")
                 if api_param_filters:
                     filter_info_parts.append(
                         f"{len(api_param_filters)} param filter(s)")
@@ -724,6 +758,7 @@ class Application(tk.Tk):
             self.tree.insert("", tk.END, values=(
                 comp.mfr_pn,
                 comp.manufacturer,
+                comp.series,
                 (comp.description[:55] + "...") if len(comp.description) > 55
                 else comp.description,
                 comp.value,
@@ -828,6 +863,16 @@ class Application(tk.Tk):
                         if mfr_filter in c.manufacturer.lower()]
             self._filter_log.append(
                 f"Manufacturer '{mfr_filter}': {before} -> {len(filtered)}")
+
+        # Series filter (always client-side)
+        series_filter = self.api_series_var.get().strip()
+        if series_filter:
+            series_lower = series_filter.lower()
+            before = len(filtered)
+            filtered = [c for c in filtered
+                        if series_lower in c.series.lower()]
+            self._filter_log.append(
+                f"Series '{series_filter}': {before} -> {len(filtered)}")
 
         # Helper: check if value appears in component description
         def _in_desc(comp, val):
@@ -959,6 +1004,7 @@ class Application(tk.Tk):
         # Update heading to show sort indicator
         col_names = {
             "mfr_pn": "MFR P/N", "manufacturer": "Manufacturer",
+            "series": "Series",
             "description": "Description", "value": "Resistance",
             "tolerance": "Tolerance", "temp_coeff": "Temp Coefficient",
             "power": "Power (Watts)", "operating_temp": "Operating Temp",
@@ -980,6 +1026,7 @@ class Application(tk.Tk):
             self.tree.insert("", tk.END, values=(
                 comp.mfr_pn,
                 comp.manufacturer,
+                comp.series,
                 (comp.description[:55] + "...") if len(comp.description) > 55
                 else comp.description,
                 comp.value,
