@@ -894,19 +894,79 @@ def api_product_to_component(product):
     # 检测引脚数量
     comp.pin_count = _detect_pin_count_api(comp)
 
-    # PADS 名称
-    import re
-    if comp.mfr_pn:
-        safe_name = re.sub(r'[^A-Za-z0-9_.-]', '_', comp.mfr_pn)
-        comp.pads_part_name = safe_name[:40]
-    else:
-        safe_name = re.sub(r'[^A-Za-z0-9_.-]', '_',
-                           comp.digikey_pn or "UNKNOWN")
-        comp.pads_part_name = safe_name[:40]
+    # PADS 名称 - 根据元件属性自动生成
+    comp.pads_part_name = _generate_pads_part_name(comp)
 
     comp.pads_decal_name = comp.package if comp.package else "UNKNOWN"
 
     return comp
+
+
+def _generate_pads_part_name(comp):
+    """Generate PADS part name from component attributes.
+    Format: RES0603_10k_YAGEO_AC_0.1W_1per_100PPM
+    Empty fields are omitted.
+    """
+    import re
+    parts = []
+
+    # Prefix + Package (e.g. RES0603)
+    prefix = {"R": "RES", "C": "CAP", "L": "IND"}.get(comp.ref_prefix, "")
+    pkg = comp.package or ""
+    if prefix and pkg:
+        parts.append(prefix + pkg)
+    elif prefix:
+        parts.append(prefix)
+    elif pkg:
+        parts.append(pkg)
+
+    # Value (resistance/capacitance/inductance) - compact form
+    if comp.value:
+        # "100 kOhms" -> "100k", "4.7 Ohms" -> "4.7R"
+        v = comp.value.strip()
+        v = re.sub(r'\s*[Oo]hms?\s*$', '', v)  # remove "Ohms"/"Ohm" suffix
+        v = v.replace(' ', '')  # "100 k" -> "100k"
+        # If pure number (no unit letter), it's Ohms -> append R
+        if re.match(r'^[\d.]+$', v):
+            v = v + "R"
+        parts.append(v)
+
+    # Tolerance: "±1%" -> "1per"
+    if comp.tolerance:
+        t = comp.tolerance.strip()
+        t = t.replace("±", "").replace("%", "per").replace(" ", "")
+        parts.append(t)
+
+    # Power Rating: "0.1W, 1/10W" -> "0.1W"
+    if comp.power_rating:
+        p = comp.power_rating.strip()
+        # Take first value if comma-separated
+        p = p.split(",")[0].strip()
+        parts.append(p)
+
+    # Temp Coefficient: "±100ppm/°C" -> "100PPM"
+    if comp.temp_coeff:
+        m = re.search(r'(\d+)\s*ppm', comp.temp_coeff, re.IGNORECASE)
+        if m:
+            parts.append(m.group(1) + "PPM")
+
+    # Manufacturer
+    if comp.manufacturer:
+        parts.append(comp.manufacturer.upper())
+
+    # Series
+    if comp.series:
+        parts.append(comp.series)
+
+    if not parts:
+        # Fallback to MFR P/N
+        safe = re.sub(r'[^A-Za-z0-9_.-]', '_', comp.mfr_pn or "UNKNOWN")
+        return safe[:40]
+
+    name = "_".join(parts)
+    # Sanitize for PADS
+    name = re.sub(r'[^A-Za-z0-9_.\-]', '', name)
+    return name[:60]
 
 
 def _normalize_api_package(raw_package):

@@ -175,8 +175,9 @@ class Application(tk.Tk):
 
         ttk.Label(frame_output, text="Filename:").grid(
             row=0, column=3, sticky=tk.W, padx=(15, 5))
-        ttk.Entry(frame_output, textvariable=self.output_name, width=20).grid(
-            row=0, column=4, sticky=tk.W, padx=5)
+        self.lbl_filename = ttk.Label(frame_output, textvariable=self.output_name,
+                                       foreground="blue", width=40, anchor=tk.W)
+        self.lbl_filename.grid(row=0, column=4, sticky=tk.W, padx=5)
 
         frame_fmt = ttk.Frame(frame_output)
         frame_fmt.grid(row=1, column=0, columnspan=5, sticky=tk.W, pady=(5, 0))
@@ -566,6 +567,71 @@ class Application(tk.Tk):
                     best_len = len(vname)
         return best_match
 
+    def _auto_generate_filename(self):
+        """Auto-generate output filename from current filter selections.
+        Example: YAGEO_AC_RES0603_1per_0.1W_100PPM
+        """
+        parts = []
+
+        # Manufacturer
+        mfr = self.api_manufacturer_var.get().strip()
+        if mfr:
+            parts.append(mfr.upper())
+
+        # Series
+        series = self.api_series_var.get().strip()
+        if series:
+            parts.append(series)
+
+        # Preset prefix + Package (e.g. RES0603)
+        preset = self.combo_preset.get()
+        prefix_map = {
+            "Chip Resistor": "RES",
+            "MLCC Capacitor": "CAP",
+            "Inductor": "IND",
+        }
+        prefix = prefix_map.get(preset, "")
+        pkg = self.api_param_entries.get("package", {}).get("var")
+        pkg_val = pkg.get().strip() if pkg else ""
+        if prefix and pkg_val:
+            parts.append(prefix + pkg_val)
+        elif prefix:
+            parts.append(prefix)
+        elif pkg_val:
+            parts.append(pkg_val)
+
+        # Tolerance: ±1% -> 1per
+        tol = self.api_param_entries.get("tolerance", {}).get("var")
+        if tol and tol.get().strip():
+            t = tol.get().strip()
+            t = t.replace("±", "").replace("%", "per").replace(" ", "")
+            parts.append(t)
+
+        # Power Rating
+        pr = self.api_param_entries.get("power_rating", {}).get("var")
+        if pr and pr.get().strip():
+            parts.append(pr.get().strip().replace("/", "_"))
+
+        # Temp Coefficient: ±100ppm/°C -> 100PPM
+        tc = self.api_param_entries.get("temp_coeff", {}).get("var")
+        if tc and tc.get().strip():
+            import re
+            raw = tc.get().strip()
+            m = re.search(r'(\d+)\s*ppm', raw, re.IGNORECASE)
+            if m:
+                parts.append(m.group(1) + "PPM")
+            else:
+                parts.append(raw)
+
+        if not parts:
+            return "digikey_library"
+
+        # Sanitize: replace unsafe chars
+        import re
+        name = "_".join(parts)
+        name = re.sub(r'[\\/:*?"<>|\s]+', '_', name)
+        return name
+
     def _api_search(self):
         """Execute API search with server-side filtering (two-phase)"""
         try:
@@ -596,6 +662,10 @@ class Application(tk.Tk):
 
         self._stop_event.clear()
         self.btn_stop.config(state=tk.NORMAL)
+
+        # Auto-generate output filename from filters
+        self.output_name.set(self._auto_generate_filename())
+
         self.progress.start(10)
         self.lbl_progress.config(text="Phase 1: Discovering filters...")
         self.lbl_api_status.config(text="Searching...", foreground="orange")
@@ -981,6 +1051,61 @@ class Application(tk.Tk):
     # ============================================================
     # Common Methods
     # ============================================================
+    @staticmethod
+    def _parse_unit_value(text):
+        """Parse a value string with SI unit suffix to a float for sorting.
+        Supports: mOhms, Ohms, kOhms, MOhms, GOhms (resistance)
+                  pF, nF, µF/uF, mF, F (capacitance)
+                  nH, µH/uH, mH, H (inductance)
+                  mW, W, kW (power)
+                  ±N% (tolerance)
+        Returns float value, or float('inf') if unparsable.
+        """
+        import re
+        s = text.strip()
+        if not s:
+            return float('inf')
+
+        # Tolerance: "±1%" or "1%"
+        m = re.match(r'[±]?\s*([\d.]+)\s*%', s)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                return float('inf')
+
+        # General: number + optional unit
+        m = re.match(r'([\d.]+)\s*([a-zA-Zµμ]*)', s)
+        if not m:
+            return float('inf')
+
+        try:
+            num = float(m.group(1))
+        except ValueError:
+            return float('inf')
+
+        unit = m.group(2)
+        # SI prefix multipliers
+        multipliers = {
+            'mohm': 1e-3, 'ohm': 1, 'kohm': 1e3, 'mohm_big': 1e6, 'gohm': 1e9,
+            'pf': 1e-12, 'nf': 1e-9, 'uf': 1e-6, 'µf': 1e-6, 'μf': 1e-6,
+            'mf': 1e-3, 'f': 1,
+            'nh': 1e-9, 'uh': 1e-6, 'µh': 1e-6, 'μh': 1e-6, 'mh': 1e-3, 'h': 1,
+            'mw': 1e-3, 'w': 1, 'kw': 1e3,
+        }
+        ul = unit.lower().rstrip('s')  # "kOhms" -> "kohm"
+
+        # Distinguish mOhm (milli) vs MOhm (mega) by case
+        if ul == 'mohm':
+            if unit.startswith('M'):
+                return num * 1e6  # Mega
+            else:
+                return num * 1e-3  # milli
+        if ul in multipliers:
+            return num * multipliers[ul]
+
+        return num  # no unit, just the number
+
     def _sort_tree(self, col):
         """Sort treeview by column header click"""
         # Toggle direction if same column clicked again
@@ -994,8 +1119,13 @@ class Application(tk.Tk):
         items = [(self.tree.set(iid, col), iid)
                  for iid in self.tree.get_children()]
 
-        # Sort items
-        items.sort(key=lambda x: x[0].lower(), reverse=not self._sort_asc)
+        # Columns that need numeric/unit-aware sorting
+        numeric_cols = {"value", "tolerance", "power"}
+        if col in numeric_cols:
+            items.sort(key=lambda x: self._parse_unit_value(x[0]),
+                       reverse=not self._sort_asc)
+        else:
+            items.sort(key=lambda x: x[0].lower(), reverse=not self._sort_asc)
 
         # Rearrange items in treeview
         for idx, (_, iid) in enumerate(items):
